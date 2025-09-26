@@ -1,7 +1,6 @@
 package service
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"fmt"
@@ -267,15 +266,52 @@ func mapValidatorStatus(status *beacon.ValidatorStatus) (uint8, error) {
 
 func (s *Service) fetchNewVals(call *bind.CallOpts, pubkeys [][]byte) (map[string]*Validator, error) {
 	newVals := make(map[string]*Validator)
-	for _, pubkey := range pubkeys {
-		key := hex.EncodeToString(pubkey)
-		if _, exist := s.validators[key]; exist {
-			return nil, fmt.Errorf("validator %s duplicate", key)
-		}
 
-		pubkeyInfo, err := s.nodeDepositContract.PubkeyInfoOf(call, pubkey)
+	pubkeyInfoList, err := s.nodeDepositContract.GetPubkeyInfoList(call, pubkeys)
+	if err != nil {
+		return nil, err
+	}
+
+	minDepositBlock := uint64(math.MaxUint64)
+	maxDepositBlock := uint64(0)
+	for _, pubkeyInfo := range pubkeyInfoList {
+		if pubkeyInfo.DepositBlock.Uint64() < minDepositBlock {
+			minDepositBlock = pubkeyInfo.DepositBlock.Uint64()
+		}
+		if pubkeyInfo.DepositBlock.Uint64() > maxDepositBlock {
+			maxDepositBlock = pubkeyInfo.DepositBlock.Uint64()
+		}
+	}
+
+	depositSigMap := make(map[string][]byte, len(pubkeys))
+	for i := minDepositBlock; i <= maxDepositBlock; i += s.eventFilterMaxSpanBlocks {
+		end := i + s.eventFilterMaxSpanBlocks - 1
+		if end > maxDepositBlock {
+			end = maxDepositBlock
+		}
+		depositedIter, err := s.nodeDepositContract.FilterDeposited(&bind.FilterOpts{
+			Start:   i,
+			End:     &end,
+			Context: context.Background(),
+		})
 		if err != nil {
 			return nil, err
+		}
+
+		for depositedIter.Next() {
+			key := hex.EncodeToString(depositedIter.Event.Pubkey)
+			mapKey := fmt.Sprintf("%d-%s", depositedIter.Event.Raw.BlockNumber, key)
+			depositSigMap[mapKey] = depositedIter.Event.ValidatorSignature
+		}
+	}
+
+	for key, pubkeyInfo := range pubkeyInfoList {
+		pubkey, err := hex.DecodeString(key)
+		if err != nil {
+			return nil, err
+		}
+		if _, exist := s.validators[key]; exist {
+			return nil, fmt.Errorf("validator %s duplicate", key)
 		}
 
 		nodeLocal, exist := s.nodes[pubkeyInfo.Owner]
@@ -295,24 +331,8 @@ func (s *Service) fetchNewVals(call *bind.CallOpts, pubkeys [][]byte) (map[strin
 			nodeLocal = &node
 		}
 
-		filterBlock := pubkeyInfo.DepositBlock.Uint64()
-		depositedIter, err := s.nodeDepositContract.FilterDeposited(&bind.FilterOpts{
-			Start:   filterBlock,
-			End:     &filterBlock,
-			Context: context.Background(),
-		})
-		if err != nil {
-			return nil, err
-		}
-
-		var depositSig []byte
-		for depositedIter.Next() {
-			if bytes.Equal(depositedIter.Event.Pubkey, pubkey) {
-				depositSig = depositedIter.Event.ValidatorSignature
-				break
-			}
-		}
-
+		mapKey := fmt.Sprintf("%d-%s", pubkeyInfo.DepositBlock.Uint64(), key)
+		depositSig := depositSigMap[mapKey]
 		if len(depositSig) == 0 {
 			return nil, fmt.Errorf("depositSignature empty, val pubkey: %s", key)
 		}
